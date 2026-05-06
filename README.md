@@ -28,15 +28,26 @@ The L2 penalty (Ridge) shrinks low-minute players toward zero, preventing extrem
 └── output/             # Results and figures (gitignored)
 ```
 
-## Example Output
+## Results — 2023-24 Full Season (1,230 games)
 
-![RAPM Rankings](output/rapm_rankings_2023-24%20(Demo).png)
+![RAPM Rankings](output/rapm_rankings_2023-24.png)
 
-**Key findings (demo run, 500 simulated games):**
-- Model recovers known player impacts with **r = 0.60** correlation
-- 5-Fold CV R²: 0.0036 — expected for RAPM; individual players explain <5% of stint-level variance in real NBA data. The value is in the *coefficients* (player rankings), not the overall fit.
-- Top-15 includes Jokic (+2.6), SGA (+2.1), Giannis (+1.8), Tatum (+3.4), LeBron (+2.0) — all known elite players
-- Bottom-15 flags known negative-impact players: Westbrook (-2.7), Cam Reddish (-5.2)
+**34,353 stints** parsed from all 1,230 regular season games across **540 players**.
+
+| Metric | Value |
+|--------|-------|
+| 5-Fold CV R² | 0.0065 |
+| 5-Fold CV RMSE | 127.28 |
+| In-sample R² | 0.0165 |
+| Qualified players (500+ min) | 360 |
+
+> **Note on R²:** A low R² is expected and correct for RAPM. Individual players explain <5% of stint-level scoring variance — basketball is inherently noisy. The value is in the *coefficients* (player rankings), not the overall fit.
+
+**Key findings:**
+- **Jokic (+3.1)** leads the league — consistent with his 2023-24 MVP runner-up season
+- **SGA (+2.9), OG Anunoby (+2.9), Paul George (+2.8)** round out the top tier
+- **LeBron (+2.1)** at #14 — strong positive impact in his 21st season
+- Bottom-15 flags known negative-impact players on losing teams (Osman, Scoot Henderson, Wiseman)
 
 ## Setup
 
@@ -70,7 +81,7 @@ python run.py --season 2023-24
 
 | Component | Detail |
 |-----------|--------|
-| Data source | `nba_api` (play-by-play + box scores) |
+| Data source | NBA CDN (play-by-play + box scores), `nba_api` (game index) |
 | Stint parsing | Substitution-event-driven, per-period lineup tracking |
 | Possessions proxy | `stint_duration / 14.5s` (avg NBA possession length) |
 | Target variable | Point margin per 100 possessions |
@@ -83,4 +94,4 @@ python run.py --season 2023-24
 - **Minimum minutes filter** (default 500): Players below this threshold are included in the model but excluded from rankings to avoid noisy estimates.
 - **Stint filtering**: Stints shorter than 10 seconds are dropped (rapid substitution noise).
 - **Period transitions**: Lineups carry forward across periods; substitutions at period starts are handled via play-by-play events.
-- **Caching**: All API responses are cached as parquet files in `data/raw/`. Delete this directory to force a re-fetch.
+- **Caching**: All API responses are cached as JSON files in `data/raw/`. Delete this directory to force a re-fetch.

@@ -1,31 +1,23 @@
-"""Fetch NBA play-by-play and box score data via nba_api with local parquet caching."""
+"""Fetch NBA play-by-play and box score data from the NBA CDN with local caching."""
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
 import pandas as pd
-from nba_api.stats.endpoints import (
-    BoxScoreTraditionalV2,
-    LeagueGameFinder,
-    PlayByPlayV2,
-)
+import requests
+from nba_api.stats.endpoints import LeagueGameFinder
 
 CACHE_DIR = Path("data/raw")
-
-CUSTOM_HEADERS = {
-    "Host": "stats.nba.com",
+CDN_PBP_URL = "https://cdn.nba.com/static/json/liveData/playbyplay/playbyplay_{game_id}.json"
+CDN_BOX_URL = "https://cdn.nba.com/static/json/liveData/boxscore/boxscore_{game_id}.json"
+CDN_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
     "Referer": "https://www.nba.com/",
-    "Origin": "https://www.nba.com",
-    "x-nba-stats-origin": "stats",
-    "x-nba-stats-token": "true",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept": "application/json, text/plain, */*",
 }
-
-API_TIMEOUT = 120
 
 
 @dataclass
@@ -33,8 +25,10 @@ class GameData:
     game_id: str
     home_team_id: int
     away_team_id: int
-    pbp: pd.DataFrame
-    box: pd.DataFrame
+    actions: list[dict]
+    home_starters: set[int]
+    away_starters: set[int]
+    player_names: dict[int, str]
 
 
 def get_season_games(season: str = "2023-24") -> pd.DataFrame:
@@ -47,8 +41,7 @@ def get_season_games(season: str = "2023-24") -> pd.DataFrame:
         season_nullable=season,
         season_type_nullable="Regular Season",
         league_id_nullable="00",
-        headers=CUSTOM_HEADERS,
-        timeout=API_TIMEOUT,
+        timeout=60,
     )
     raw = finder.get_data_frames()[0]
 
@@ -65,29 +58,50 @@ def get_season_games(season: str = "2023-24") -> pd.DataFrame:
     return games
 
 
-def _fetch_cached(endpoint_cls, game_id: str, prefix: str, **kwargs) -> pd.DataFrame:
-    cache_path = CACHE_DIR / f"{prefix}_{game_id}.parquet"
+def _fetch_cdn_json(url: str, cache_key: str) -> dict:
+    cache_path = CACHE_DIR / f"{cache_key}.json"
     if cache_path.exists():
-        return pd.read_parquet(cache_path)
+        with open(cache_path) as f:
+            return json.load(f)
 
-    ep = endpoint_cls(game_id=game_id, headers=CUSTOM_HEADERS, timeout=API_TIMEOUT, **kwargs)
-    df = ep.get_data_frames()[0]
+    r = requests.get(url, headers=CDN_HEADERS, timeout=30)
+    r.raise_for_status()
+    data = r.json()
 
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(cache_path, index=False)
-    return df
+    with open(cache_path, "w") as f:
+        json.dump(data, f)
+    return data
+
+
+def _parse_boxscore(box_data: dict) -> tuple[int, int, set[int], set[int], dict[int, str]]:
+    """Extract team IDs, starters, and player names from boxscore JSON."""
+    game = box_data["game"]
+    home = game["homeTeam"]
+    away = game["awayTeam"]
+
+    home_id = home["teamId"]
+    away_id = away["teamId"]
+
+    home_starters = {p["personId"] for p in home["players"] if p.get("starter") == "1"}
+    away_starters = {p["personId"] for p in away["players"] if p.get("starter") == "1"}
+
+    names = {}
+    for p in home["players"] + away["players"]:
+        names[p["personId"]] = p["name"]
+
+    return home_id, away_id, home_starters, away_starters, names
 
 
 def fetch_season_data(
     season: str = "2023-24",
     max_games: int | None = None,
-    delay: float = 1.0,
-    retries: int = 3,
+    delay: float = 0.3,
 ) -> list[GameData]:
-    """Fetch play-by-play and box score data for a season.
+    """Fetch play-by-play and box score data for a season via NBA CDN.
 
     Returns a list of GameData objects, one per successfully fetched game.
-    Data is cached locally as parquet files to avoid redundant API calls.
+    Data is cached locally as JSON files.
     """
     games = get_season_games(season)
     if max_games:
@@ -100,32 +114,28 @@ def fetch_season_data(
         gid = row["GAME_ID"]
         print(f"  [{len(results) + 1}/{total}] {gid}", end="", flush=True)
 
-        success = False
-        for attempt in range(retries):
-            try:
-                pbp = _fetch_cached(PlayByPlayV2, gid, "pbp")
-                time.sleep(delay)
-                box = _fetch_cached(BoxScoreTraditionalV2, gid, "box")
-                time.sleep(delay)
+        try:
+            pbp_data = _fetch_cdn_json(CDN_PBP_URL.format(game_id=gid), f"pbp_{gid}")
+            box_data = _fetch_cdn_json(CDN_BOX_URL.format(game_id=gid), f"box_{gid}")
+            time.sleep(delay)
 
-                results.append(
-                    GameData(
-                        game_id=gid,
-                        home_team_id=int(row["HOME_TEAM_ID"]),
-                        away_team_id=int(row["AWAY_TEAM_ID"]),
-                        pbp=pbp,
-                        box=box,
-                    )
+            home_id, away_id, home_starters, away_starters, names = _parse_boxscore(box_data)
+            actions = pbp_data["game"]["actions"]
+
+            results.append(
+                GameData(
+                    game_id=gid,
+                    home_team_id=home_id,
+                    away_team_id=away_id,
+                    actions=actions,
+                    home_starters=home_starters,
+                    away_starters=away_starters,
+                    player_names=names,
                 )
-                print(" OK", flush=True)
-                success = True
-                break
-            except Exception as e:
-                if attempt < retries - 1:
-                    wait = delay * (attempt + 2)
-                    print(f" retry({attempt + 1})...", end="", flush=True)
-                    time.sleep(wait)
-                else:
-                    print(f" ERROR: {e}", flush=True)
+            )
+            print(" OK", flush=True)
+        except Exception as e:
+            print(f" ERROR: {e}", flush=True)
+            continue
 
     return results

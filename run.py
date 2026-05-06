@@ -18,10 +18,7 @@ def _build_player_name_map(game_data_list) -> dict[int, str]:
     """Build player_id → player_name mapping from box score data."""
     names = {}
     for game in game_data_list:
-        for _, row in game.box.iterrows():
-            pid = int(row["PLAYER_ID"])
-            if pid not in names:
-                names[pid] = row["PLAYER_NAME"]
+        names.update(game.player_names)
     return names
 
 

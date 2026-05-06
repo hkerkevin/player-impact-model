@@ -6,22 +6,26 @@ Each stint records which 10 players are on court and the point differential.
 
 from __future__ import annotations
 
+import re
+from itertools import groupby
+
 import pandas as pd
 import numpy as np
 
 from src.data import GameData
 
-EVENT_MADE_SHOT = 1
-EVENT_FREE_THROW = 3
-EVENT_SUBSTITUTION = 8
+
+def _clock_to_seconds(clock_str: str) -> float:
+    """Parse ISO 8601 duration clock (e.g. 'PT07M09.00S') to seconds remaining."""
+    m = re.match(r"PT(\d+)M([\d.]+)S", clock_str)
+    if not m:
+        return 0.0
+    return int(m.group(1)) * 60 + float(m.group(2))
 
 
-def _elapsed_seconds(period: int, pctimestring: str) -> float:
+def _elapsed_seconds(period: int, clock_str: str) -> float:
     """Convert period + game clock to cumulative elapsed seconds."""
-    parts = pctimestring.split(":")
-    mins, secs = int(parts[0]), int(parts[1])
-    remaining = mins * 60 + secs
-
+    remaining = _clock_to_seconds(clock_str)
     period_length = 12 * 60 if period <= 4 else 5 * 60
     elapsed_in_period = period_length - remaining
 
@@ -32,132 +36,130 @@ def _elapsed_seconds(period: int, pctimestring: str) -> float:
     return prior + elapsed_in_period
 
 
-def _get_starters(box_df: pd.DataFrame, team_id: int) -> set[int]:
-    """Extract starting five from box score by START_POSITION field."""
-    team = box_df[box_df["TEAM_ID"] == team_id]
-    starters = team[
-        team["START_POSITION"].notna() & (team["START_POSITION"] != "")
-    ]
-    return set(starters["PLAYER_ID"].astype(int).tolist())
+def _apply_sub_batch(subs: list[dict], home_lineup: set, away_lineup: set, home_team_id: int):
+    """Apply a batch of simultaneous substitutions to lineups."""
+    for sub in subs:
+        pid = sub["personId"]
+        tid = sub.get("teamId")
+        is_home = tid == home_team_id
+        lineup = home_lineup if is_home else away_lineup
 
-
-def _score_from_event(row, home_team_id: int) -> tuple[int, int]:
-    """Return (home_points, away_points) for a single scoring event."""
-    etype = row["EVENTMSGTYPE"]
-
-    if etype == EVENT_MADE_SHOT:
-        team_id = row.get("PLAYER1_TEAM_ID")
-        if pd.isna(team_id):
-            return 0, 0
-        team_id = int(team_id)
-        desc = str(row.get("HOMEDESCRIPTION") or "") + str(row.get("VISITORDESCRIPTION") or "")
-        pts = 3 if "3PT" in desc else 2
-        return (pts, 0) if team_id == home_team_id else (0, pts)
-
-    if etype == EVENT_FREE_THROW:
-        desc = str(row.get("HOMEDESCRIPTION") or "") + str(row.get("VISITORDESCRIPTION") or "")
-        if "MISS" in desc.upper():
-            return 0, 0
-        team_id = row.get("PLAYER1_TEAM_ID")
-        if pd.isna(team_id):
-            return 0, 0
-        team_id = int(team_id)
-        return (1, 0) if team_id == home_team_id else (0, 1)
-
-    return 0, 0
-
-
-def _close_stint(
-    game_id: str,
-    home_lineup: set[int],
-    away_lineup: set[int],
-    start_time: float,
-    end_time: float,
-    home_pts: int,
-    away_pts: int,
-) -> dict | None:
-    duration = end_time - start_time
-    if duration <= 0 or len(home_lineup) != 5 or len(away_lineup) != 5:
-        return None
-    return {
-        "game_id": game_id,
-        "home_players": frozenset(home_lineup),
-        "away_players": frozenset(away_lineup),
-        "duration_seconds": duration,
-        "home_points": home_pts,
-        "away_points": away_pts,
-        "margin": home_pts - away_pts,
-    }
+        if sub["subType"] == "out":
+            lineup.discard(pid)
+        elif sub["subType"] == "in":
+            lineup.add(pid)
 
 
 def parse_game_stints(game: GameData) -> list[dict]:
-    """Parse a single game's play-by-play into stints."""
-    home_lineup = _get_starters(game.box, game.home_team_id)
-    away_lineup = _get_starters(game.box, game.away_team_id)
+    """Parse a single game's CDN play-by-play actions into stints."""
+    home_lineup = set(game.home_starters)
+    away_lineup = set(game.away_starters)
 
     if len(home_lineup) != 5 or len(away_lineup) != 5:
         return []
 
-    pbp = game.pbp.sort_values(["PERIOD", "EVENTNUM"]).reset_index(drop=True)
+    actions = sorted(game.actions, key=lambda a: a["orderNumber"])
 
     stints = []
     stint_start = 0.0
-    h_pts = a_pts = 0
     current_period = 1
+    home_score = away_score = 0
+    stint_start_home = stint_start_away = 0
 
-    for _, row in pbp.iterrows():
-        period = row["PERIOD"]
-        etype = row["EVENTMSGTYPE"]
+    # Group substitutions by their timestamp so they're applied atomically
+    i = 0
+    while i < len(actions):
+        action = actions[i]
+        period = action["period"]
+        clock = action.get("clock", "PT00M00.00S")
 
-        # Period transition — close current stint, carry lineups forward
+        # Update running score
+        sh = action.get("scoreHome")
+        sa = action.get("scoreAway")
+        if sh is not None and sa is not None:
+            try:
+                home_score = int(sh)
+                away_score = int(sa)
+            except (ValueError, TypeError):
+                pass
+
+        # Period transition
         if period != current_period:
-            end_t = _elapsed_seconds(current_period, "0:00")
-            s = _close_stint(game.game_id, home_lineup, away_lineup, stint_start, end_t, h_pts, a_pts)
-            if s:
-                stints.append(s)
+            t = _elapsed_seconds(current_period, "PT00M00.00S")
+            duration = t - stint_start
+            if duration > 0 and len(home_lineup) == 5 and len(away_lineup) == 5:
+                stints.append({
+                    "game_id": game.game_id,
+                    "home_players": frozenset(home_lineup),
+                    "away_players": frozenset(away_lineup),
+                    "duration_seconds": duration,
+                    "home_points": home_score - stint_start_home,
+                    "away_points": away_score - stint_start_away,
+                    "margin": (home_score - stint_start_home) - (away_score - stint_start_away),
+                })
             current_period = period
-            clock = "12:00" if period <= 4 else "5:00"
-            stint_start = _elapsed_seconds(period, clock)
-            h_pts = a_pts = 0
+            period_clock = "PT12M00.00S" if period <= 4 else "PT05M00.00S"
+            stint_start = _elapsed_seconds(period, period_clock)
+            stint_start_home = home_score
+            stint_start_away = away_score
 
-        # Substitution — close stint, update lineup
-        if etype == EVENT_SUBSTITUTION:
-            t = _elapsed_seconds(period, row["PCTIMESTRING"])
-            s = _close_stint(game.game_id, home_lineup, away_lineup, stint_start, t, h_pts, a_pts)
-            if s:
-                stints.append(s)
+        # Collect all substitutions at the same (period, clock)
+        if action.get("actionType") == "substitution":
+            sub_batch = []
+            sub_period = period
+            sub_clock = clock
+            t = _elapsed_seconds(period, clock)
+
+            while i < len(actions) and actions[i].get("actionType") == "substitution" \
+                    and actions[i]["period"] == sub_period and actions[i].get("clock") == sub_clock:
+                sub_batch.append(actions[i])
+                # Update score from sub events too
+                sh2 = actions[i].get("scoreHome")
+                sa2 = actions[i].get("scoreAway")
+                if sh2 is not None and sa2 is not None:
+                    try:
+                        home_score = int(sh2)
+                        away_score = int(sa2)
+                    except (ValueError, TypeError):
+                        pass
+                i += 1
+
+            # Close current stint
+            duration = t - stint_start
+            if duration > 0 and len(home_lineup) == 5 and len(away_lineup) == 5:
+                stints.append({
+                    "game_id": game.game_id,
+                    "home_players": frozenset(home_lineup),
+                    "away_players": frozenset(away_lineup),
+                    "duration_seconds": duration,
+                    "home_points": home_score - stint_start_home,
+                    "away_points": away_score - stint_start_away,
+                    "margin": (home_score - stint_start_home) - (away_score - stint_start_away),
+                })
+
+            # Apply all subs atomically
+            _apply_sub_batch(sub_batch, home_lineup, away_lineup, game.home_team_id)
+
             stint_start = t
-            h_pts = a_pts = 0
-
-            p_in = row.get("PLAYER1_ID")
-            p_out = row.get("PLAYER2_ID")
-            if pd.notna(p_in) and pd.notna(p_out):
-                p_in, p_out = int(p_in), int(p_out)
-                # Determine direction by checking who is currently on court
-                if p_out in home_lineup:
-                    home_lineup.discard(p_out)
-                    home_lineup.add(p_in)
-                elif p_out in away_lineup:
-                    away_lineup.discard(p_out)
-                    away_lineup.add(p_in)
-                elif p_in in home_lineup:
-                    home_lineup.discard(p_in)
-                    home_lineup.add(p_out)
-                elif p_in in away_lineup:
-                    away_lineup.discard(p_in)
-                    away_lineup.add(p_out)
+            stint_start_home = home_score
+            stint_start_away = away_score
             continue
 
-        # Scoring
-        dh, da = _score_from_event(row, game.home_team_id)
-        h_pts += dh
-        a_pts += da
+        i += 1
 
     # Close final stint
-    end_t = _elapsed_seconds(current_period, "0:00")
-    s = _close_stint(game.game_id, home_lineup, away_lineup, stint_start, end_t, h_pts, a_pts)
-    if s:
-        stints.append(s)
+    t = _elapsed_seconds(current_period, "PT00M00.00S")
+    duration = t - stint_start
+    if duration > 0 and len(home_lineup) == 5 and len(away_lineup) == 5:
+        stints.append({
+            "game_id": game.game_id,
+            "home_players": frozenset(home_lineup),
+            "away_players": frozenset(away_lineup),
+            "duration_seconds": duration,
+            "home_points": home_score - stint_start_home,
+            "away_points": away_score - stint_start_away,
+            "margin": (home_score - stint_start_home) - (away_score - stint_start_away),
+        })
 
     return stints
 
@@ -169,6 +171,5 @@ def build_stint_dataset(game_data_list: list[GameData]) -> pd.DataFrame:
         all_stints.extend(parse_game_stints(game))
 
     df = pd.DataFrame(all_stints)
-    # Drop stints shorter than 10 seconds (noise from rapid substitutions)
     df = df[df["duration_seconds"] >= 10].reset_index(drop=True)
     return df

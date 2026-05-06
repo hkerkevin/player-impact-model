@@ -4,6 +4,8 @@ A stint is a continuous stretch of game time where no substitutions occur.
 Each stint records which 10 players are on court and the point differential.
 """
 
+from __future__ import annotations
+
 import pandas as pd
 import numpy as np
 

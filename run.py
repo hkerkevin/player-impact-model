@@ -4,6 +4,8 @@ Usage:
     python run.py --season 2023-24 --max-games 100 --alpha 5000
 """
 
+from __future__ import annotations
+
 import argparse
 
 from src.data import fetch_season_data

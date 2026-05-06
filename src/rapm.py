@@ -15,10 +15,13 @@ The L2 penalty (Ridge) shrinks low-minute players toward zero, preventing
 extreme coefficients from small sample sizes.
 """
 
+from __future__ import annotations
+
 import numpy as np
 import pandas as pd
 from scipy.sparse import coo_matrix
 from sklearn.linear_model import RidgeCV, Ridge
+from sklearn.model_selection import KFold
 
 AVG_POSSESSION_SECONDS = 14.5
 
@@ -97,6 +100,29 @@ def fit_rapm(
 
     if hasattr(model, "alpha_"):
         print(f"  Cross-validated alpha: {model.alpha_}")
+
+    # Evaluation: 5-fold cross-validation with proper sample weights
+    eval_alpha = model.alpha_ if hasattr(model, "alpha_") else alpha
+    kf = KFold(n_splits=5, shuffle=True, random_state=42)
+    cv_r2, cv_rmse = [], []
+    for train_idx, test_idx in kf.split(X):
+        fold_model = Ridge(alpha=eval_alpha, fit_intercept=False)
+        fold_model.fit(X[train_idx], y[train_idx], sample_weight=w[train_idx])
+        y_pred_fold = fold_model.predict(X[test_idx])
+        w_test = w[test_idx]
+        ss_res = np.sum(w_test * (y[test_idx] - y_pred_fold) ** 2)
+        ss_tot = np.sum(w_test * (y[test_idx] - np.average(y[test_idx], weights=w_test)) ** 2)
+        cv_r2.append(1 - ss_res / ss_tot)
+        cv_rmse.append(np.sqrt(np.mean(w_test * (y[test_idx] - y_pred_fold) ** 2)))
+    print(f"  5-Fold CV R²:   {np.mean(cv_r2):.4f} (+/-{np.std(cv_r2):.4f})")
+    print(f"  5-Fold CV RMSE: {np.mean(cv_rmse):.2f} (+/-{np.std(cv_rmse):.2f})")
+
+    # In-sample R²
+    y_pred = model.predict(X)
+    ss_res = np.sum(w * (y - y_pred) ** 2)
+    ss_tot = np.sum(w * (y - np.average(y, weights=w)) ** 2)
+    r2_train = 1 - ss_res / ss_tot
+    print(f"  In-sample R²:   {r2_train:.4f}")
 
     # Compute total minutes per player
     all_players_set = {pid: 0.0 for pid in players}

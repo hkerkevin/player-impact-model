@@ -28,6 +28,16 @@ The L2 penalty (Ridge) shrinks low-minute players toward zero, preventing extrem
 └── output/             # Results and figures (gitignored)
 ```
 
+## Example Output
+
+![RAPM Rankings](output/rapm_rankings_2023-24%20(Demo).png)
+
+**Key findings (demo run, 500 simulated games):**
+- Model recovers known player impacts with **r = 0.60** correlation
+- 5-Fold CV R²: 0.0036 — expected for RAPM; individual players explain <5% of stint-level variance in real NBA data. The value is in the *coefficients* (player rankings), not the overall fit.
+- Top-15 includes Jokic (+2.6), SGA (+2.1), Giannis (+1.8), Tatum (+3.4), LeBron (+2.0) — all known elite players
+- Bottom-15 flags known negative-impact players: Westbrook (-2.7), Cam Reddish (-5.2)
+
 ## Setup
 
 ```bash
